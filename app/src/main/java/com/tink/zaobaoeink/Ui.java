@@ -1,8 +1,11 @@
 package com.tink.zaobaoeink;
 
 import android.content.Context;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.StateListDrawable;
 import android.view.View;
 import android.widget.Button;
 import android.widget.TextView;
@@ -34,16 +37,30 @@ public final class Ui {
         return t;
     }
 
-    /** Flat e-ink button: white background, black 1px border, no ripple/shadow (API 23 default state list is replaced). */
+    /**
+     * Flat e-ink button: white background, black border, no ripple/shadow
+     * (API 23 default state list is replaced). While pressed it inverts to
+     * black background / white text — on an e-ink screen with slow refresh
+     * and no haptics, that single inverted frame is the only confirmation
+     * that a tap actually landed, so every button in the app gets it here.
+     */
     public static Button button(Context ctx, String s) {
         Button b = new Button(ctx);
         b.setText(s);
         b.setTextSize(15);
-        b.setTextColor(BLACK);
-        android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.GradientDrawable();
-        gd.setColor(Color.WHITE);
-        gd.setStroke(2, BLACK);
-        b.setBackground(gd);
+        b.setTextColor(new ColorStateList(
+                new int[][]{{android.R.attr.state_pressed}, {}},
+                new int[]{Color.WHITE, BLACK}));
+        GradientDrawable normal = new GradientDrawable();
+        normal.setColor(Color.WHITE);
+        normal.setStroke(2, BLACK);
+        GradientDrawable pressed = new GradientDrawable();
+        pressed.setColor(BLACK);
+        pressed.setStroke(2, BLACK);
+        StateListDrawable bg = new StateListDrawable();
+        bg.addState(new int[]{android.R.attr.state_pressed}, pressed);
+        bg.addState(new int[]{}, normal);
+        b.setBackground(bg);
         b.setStateListAnimator(null);
         b.setMinHeight(0);
         b.setMinimumHeight(0);

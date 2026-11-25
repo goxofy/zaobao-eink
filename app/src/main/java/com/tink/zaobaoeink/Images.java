@@ -29,6 +29,15 @@ public final class Images {
                 }
             };
 
+    /** Decoded full-width article images are far bigger than list thumbnails. */
+    private static final LruCache<String, Bitmap> BODY_CACHE =
+            new LruCache<String, Bitmap>(10 * 1024 * 1024) {
+                @Override
+                protected int sizeOf(String key, Bitmap value) {
+                    return value.getByteCount();
+                }
+            };
+
     private Images() {
     }
 
@@ -41,6 +50,36 @@ public final class Images {
         String key = urlStr + "@" + targetPx;
         Bitmap hit = CACHE.get(key);
         if (hit != null) return hit;
+        Bitmap b = fetch(urlStr, targetPx);
+        if (b != null) CACHE.put(key, b);
+        return b;
+    }
+
+    /**
+     * Article body image: down-sampled around the text column width, grayscaled,
+     * and scaled to at most the column width so cached bitmaps stay bounded.
+     * Blocking; call on the background executor. Returns null on any failure.
+     */
+    public static Bitmap loadArticleImage(String urlStr, int targetPx) {
+        String key = urlStr + "@" + targetPx;
+        Bitmap hit = BODY_CACHE.get(key);
+        if (hit != null) return hit;
+        Bitmap b = fetch(urlStr, targetPx);
+        if (b == null) return null;
+        if (b.getWidth() > targetPx) {
+            int nh = Math.max(1, (int) ((long) b.getHeight() * targetPx / b.getWidth()));
+            Bitmap scaled = Bitmap.createScaledBitmap(b, targetPx, nh, true);
+            if (scaled != b) {
+                b.recycle();
+                b = scaled;
+            }
+        }
+        BODY_CACHE.put(key, b);
+        return b;
+    }
+
+    /** Network fetch + decode + grayscale, no caching. Background thread only. */
+    private static Bitmap fetch(String urlStr, int targetPx) {
         HttpURLConnection conn = null;
         InputStream in = null;
         try {
@@ -67,7 +106,6 @@ public final class Images {
             if (raw == null) return null;
             Bitmap gray = toGrayscale(raw);
             if (gray != raw) raw.recycle();
-            CACHE.put(key, gray);
             return gray;
         } catch (IOException e) {
             return null;

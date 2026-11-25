@@ -10,8 +10,8 @@ android {
         applicationId 'com.tink.zaobaoeink'
         minSdk 23
         targetSdk 34
-        versionCode 1
-        versionName '1.0'
+        versionCode 8
+        versionName '1.7'
     }
 
     buildTypes {

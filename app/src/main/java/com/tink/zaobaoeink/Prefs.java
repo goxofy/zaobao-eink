@@ -29,6 +29,15 @@ public final class Prefs {
         sp(ctx).edit().putInt("fontLevel", level).apply();
     }
 
+    /** Key of the home-screen tab selected last time (a section feed). */
+    public static String lastTab(Context ctx) {
+        return sp(ctx).getString("lastTab", "");
+    }
+
+    public static void setLastTab(Context ctx, String key) {
+        sp(ctx).edit().putString("lastTab", key == null ? "" : key).apply();
+    }
+
     public static boolean imagesEnabled(Context ctx) {
         return sp(ctx).getBoolean("images", false);
     }

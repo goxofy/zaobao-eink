@@ -3,9 +3,12 @@ package com.tink.zaobaoeink;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.graphics.Bitmap;
 import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.Typeface;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.text.Layout;
 import android.text.SpannableStringBuilder;
@@ -13,7 +16,6 @@ import android.text.Spanned;
 import android.text.StaticLayout;
 import android.text.TextPaint;
 import android.text.style.AbsoluteSizeSpan;
-import android.text.style.BackgroundColorSpan;
 import android.text.style.ClickableSpan;
 import android.text.style.ForegroundColorSpan;
 import android.text.style.StyleSpan;
@@ -44,7 +46,11 @@ import java.util.regex.Pattern;
  * Article page: the whole document is one Spanned text (title/meta/preview +
  * structured body from BodyParser). Pages are pre-sliced with StaticLayout on the
  * background executor; a page turn only swaps the displayed slice.
- * Taps are resolved manually: link/image spans first, left/right half paging after.
+ * Taps are resolved manually: link spans first, then the zoom badge on inline
+ * images (v1.6: the image box itself no longer zooms — taps on it page like
+ * anywhere else), left/right half paging last.
+ * Article-to-article jumps (related list, in-body story links) replace this
+ * activity instead of stacking, so Back always lands on the article list.
  */
 public class ArticleActivity extends Activity {
 
@@ -55,6 +61,7 @@ public class ArticleActivity extends Activity {
 
     private TextView bodyView;
     private TextView pageInfo;
+    private Button imgBtn;
     private ListView relatedList;
     private LinearLayout statusBox;
     private TextView statusText;
@@ -67,6 +74,9 @@ public class ArticleActivity extends Activity {
     private int pageIdx = 0;
     private boolean relatedMode = false;
     private boolean fetching = false;
+    /** Text-area size the current pages were sliced for; -1 until first paginate. */
+    private int pagedW = -1;
+    private int pagedH = -1;
 
     /** Raw pieces kept so the document can be rebuilt when the font size changes. */
     private static final class Parts {
@@ -75,6 +85,10 @@ public class ArticleActivity extends Activity {
         boolean paid;
         String preview = "";
         String bodyHtml = "";
+        /** Cover image (detail data.images[0]); empty when the payload has none. */
+        String coverUrl = "";
+        /** Every rendition URL of images[0], for cover-vs-body dedupe. */
+        final List<String> coverSpecs = new ArrayList<String>();
     }
 
     private Parts parts;
@@ -147,6 +161,18 @@ public class ArticleActivity extends Activity {
             }
         });
         bar.addView(refreshBtn);
+        imgBtn = Ui.button(this, Prefs.imagesEnabled(this) ? "图片：开" : "图片：关");
+        LinearLayout.LayoutParams iLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        iLp.leftMargin = Ui.dp(this, 6);
+        imgBtn.setLayoutParams(iLp);
+        imgBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                toggleImages();
+            }
+        });
+        bar.addView(imgBtn);
         root.addView(bar);
 
         View div = Ui.divider(this);
@@ -173,6 +199,22 @@ public class ArticleActivity extends Activity {
                 return true;
             }
         });
+        // If the text area settles to a different size after the pages were
+        // sliced (first layout pass, system bars appearing, rotation), the
+        // slices no longer match the view: re-slice for the real size,
+        // keeping the reader on the same text offset.
+        bodyView.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+            @Override
+            public void onLayoutChange(View v, int left, int top, int right, int bottom,
+                                       int oldLeft, int oldTop, int oldRight, int oldBottom) {
+                if (doc == null || pages == null || pages.isEmpty()) return;
+                int w = (right - left) - bodyView.getPaddingLeft() - bodyView.getPaddingRight();
+                int h = (bottom - top) - bodyView.getPaddingTop() - bodyView.getPaddingBottom();
+                if (w > 0 && h > 0 && (w != pagedW || h != pagedH)) {
+                    paginate(pages.get(pageIdx)[0]);
+                }
+            }
+        });
         content.addView(bodyView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
@@ -191,6 +233,9 @@ public class ArticleActivity extends Activity {
                 it.putExtra("documentId", c.documentId);
                 it.putExtra("headline", c.headline);
                 startActivity(it);
+                // Replace, don't stack: however deep the reader hops through
+                // related articles, Back must land straight on the list.
+                finish();
             }
         });
         relatedList.setVisibility(View.GONE);
@@ -302,6 +347,30 @@ public class ArticleActivity extends Activity {
                 p.preview = d.optString("contentPreview", "").trim();
                 p.bodyHtml = d.optString("body", "");
 
+                // Cover/hero image: data.images[0] — the same photo the list
+                // rows show as a thumbnail. It never appears in the body HTML
+                // (the body's own <img>s are different pictures), so the
+                // article page has to place it explicitly (buildDoc).
+                // Spec choice: "url" is the full-resolution original, the
+                // same kind of source the body <img> pipeline consumes and
+                // downsamples via Images.loadArticleImage; "large" is a
+                // 1140px-wide rendition, narrower than the article column
+                // on the XF-A1 (~1250px) and would be upscaled blurry.
+                JSONArray imgs = d.optJSONArray("images");
+                if (imgs != null && imgs.length() > 0) {
+                    JSONObject im = imgs.optJSONObject(0);
+                    if (im != null) {
+                        p.coverUrl = im.optString("url", "");
+                        if (p.coverUrl.length() == 0) p.coverUrl = im.optString("large", "");
+                        String[] specKeys = {"url", "large", "fullPath",
+                                "thumbnail", "rotator", "square"};
+                        for (String k : specKeys) {
+                            String v = im.optString(k, "");
+                            if (v.length() > 0) p.coverSpecs.add(v);
+                        }
+                    }
+                }
+
                 List<Models.Card> rel = new ArrayList<Models.Card>();
                 JSONArray relArr = d.optJSONArray("related");
                 if (relArr != null) {
@@ -309,6 +378,9 @@ public class ArticleActivity extends Activity {
                         JSONObject o = relArr.optJSONObject(i);
                         if (o == null) continue;
                         Models.Card c = Models.toCard(o);
+                        // v1.5: related items show exactly as returned, paid
+                        // and free mixed, no filter and no badge (the v1.3
+                        // paid filter here was dropped by user decision).
                         if (c != null) rel.add(c);
                     }
                 }
@@ -347,15 +419,6 @@ public class ArticleActivity extends Activity {
         sb.append('\n');
 
         int ms = sb.length();
-        if (p.paid) {
-            int bs = sb.length();
-            sb.append(" 付费 ");
-            sb.setSpan(new BackgroundColorSpan(Color.BLACK), bs, sb.length(),
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-            sb.setSpan(new ForegroundColorSpan(Color.WHITE), bs, sb.length(),
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-            sb.append("  ");
-        }
         sb.append(p.meta);
         sb.setSpan(new AbsoluteSizeSpan((int) (bodyPx * 0.78f)), ms, sb.length(),
                 Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
@@ -363,7 +426,19 @@ public class ArticleActivity extends Activity {
                 Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         sb.append('\n').append('\n');
 
-        SpannableStringBuilder body = BodyParser.parse(p.bodyHtml, bodyPx, density);
+        boolean imagesOn = Prefs.imagesEnabled(this);
+        int tw = textWidthPx();
+        SpannableStringBuilder body = BodyParser.parse(p.bodyHtml, bodyPx, density,
+                imagesOn, tw, LINE_MULT);
+        // Hero image (v1.7): the cover photo goes right under the meta line,
+        // before the lead/body text, as the first element of the text flow —
+        // same image box, grayscale loading, zoom badge and tap rules as an
+        // in-body image. Skipped when images are off (no placeholder), when
+        // the payload has no cover, or when the body already shows the same
+        // file. The caption is not rendered.
+        if (imagesOn && p.coverUrl.length() > 0 && !coverInBody(p, body)) {
+            BodyParser.appendImageBox(sb, p.coverUrl, density, tw, LINE_MULT);
+        }
         if (p.preview.length() > 0) {
             String bodyText = body.toString();
             int nl = bodyText.indexOf('\n');
@@ -385,6 +460,40 @@ public class ArticleActivity extends Activity {
         return sb;
     }
 
+    /**
+     * True when the parsed body already contains the cover image. Comparison
+     * is by image-file identity: the URL path (which ends in the file's hash)
+     * with the query string dropped and a trailing ".jpg" stripped — the
+     * cover's renditions carry "?o=zbimg…" queries and a .jpg suffix, while
+     * body {@code <img>} URLs are bare paths. Every rendition of images[0]
+     * counts as the cover side; any body ImageSpan URL matching one of them
+     * means the same file is already in the flow.
+     */
+    private static boolean coverInBody(Parts p, SpannableStringBuilder body) {
+        if (p.coverSpecs.isEmpty()) return false;
+        java.util.HashSet<String> cover = new java.util.HashSet<String>();
+        for (String s : p.coverSpecs) cover.add(imageFileKey(s));
+        BodyParser.ImageSpan[] spans = body.getSpans(0, body.length(),
+                BodyParser.ImageSpan.class);
+        if (spans == null) return false;
+        for (BodyParser.ImageSpan sp : spans) {
+            if (cover.contains(imageFileKey(sp.url))) return true;
+        }
+        return false;
+    }
+
+    /** Image-file identity of a URL: full path minus query and ".jpg" suffix. */
+    private static String imageFileKey(String url) {
+        if (url == null) return "";
+        String u = url;
+        int q = u.indexOf('?');
+        if (q >= 0) u = u.substring(0, q);
+        if (u.length() > 4 && u.substring(u.length() - 4).equalsIgnoreCase(".jpg")) {
+            u = u.substring(0, u.length() - 4);
+        }
+        return u;
+    }
+
     // ---------------- pagination ----------------
 
     private void paginate(final int keepOffset) {
@@ -400,33 +509,59 @@ public class ArticleActivity extends Activity {
             });
             return;
         }
+        pagedW = w;
+        pagedH = h;
         final TextPaint paint = new TextPaint(bodyView.getPaint());
+        // Page budget: the raw text height minus a safety margin. A displayed
+        // page is re-laid-out by the TextView on its own, and that second pass
+        // is systematically a little taller than this measuring pass over the
+        // whole document (the slice re-adds the font's top/bottom padding at
+        // both of its ends; fallback-font line spacing applies there too).
+        // Budgeting the full height let a page measure as "fits" while the
+        // TextView clipped its last line or two (the v1.5 "1/1 but cut off"
+        // bug). Reserve the font padding plus one full line: a page may end
+        // a line early, but content can never be silently clipped.
+        Paint.FontMetricsInt fm = paint.getFontMetricsInt();
+        int lineH = (int) Math.ceil((fm.descent - fm.ascent) * (double) LINE_MULT);
+        int padExtra = Math.max(0, fm.top - fm.ascent) + Math.max(0, fm.bottom - fm.descent);
+        int budget = h - padExtra - lineH;
+        if (budget < lineH) budget = h; // degenerate tiny area: fall back to raw height
+        final int pageBudget = budget;
         final SpannableStringBuilder text = doc;
         Bg.run(new Bg.Work<List<int[]>>() {
             @Override
             public List<int[]> run() {
-                StaticLayout layout = StaticLayout.Builder
+                // Measure with the TextView's own layout parameters (same
+                // width, same paint, same spacing) so line heights match what
+                // the view will actually render: TextView defaults are
+                // high-quality breaking, normal hyphenation, and — since
+                // API 28 — fallback-font line spacing, which a bare
+                // StaticLayout.Builder leaves off and under-measures
+                // mixed CJK/Latin lines.
+                StaticLayout.Builder lb = StaticLayout.Builder
                         .obtain(text, 0, text.length(), paint, w)
                         .setAlignment(Layout.Alignment.ALIGN_NORMAL)
                         .setLineSpacing(0, LINE_MULT)
                         .setIncludePad(true)
-                        .build();
-                List<int[]> result = new ArrayList<int[]>();
-                int lines = layout.getLineCount();
-                int line = 0;
-                while (line < lines) {
-                    int startLine = line;
-                    int top = layout.getLineTop(startLine);
-                    while (line < lines && layout.getLineBottom(line) - top <= h) {
-                        line++;
-                    }
-                    if (line == startLine) line++; // a single line taller than the page: take it anyway
-                    int s = layout.getLineStart(startLine);
-                    int e = layout.getLineEnd(line - 1);
-                    result.add(new int[]{s, e});
+                        .setBreakStrategy(Layout.BREAK_STRATEGY_HIGH_QUALITY)
+                        .setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NORMAL);
+                if (Build.VERSION.SDK_INT >= 28) {
+                    lb.setUseLineSpacingFromFallbacks(true);
                 }
-                if (result.isEmpty()) result.add(new int[]{0, text.length()});
-                return result;
+                StaticLayout layout = lb.build();
+                int lines = layout.getLineCount();
+                int[] starts = new int[lines];
+                int[] ends = new int[lines];
+                int[] tops = new int[lines];
+                int[] bottoms = new int[lines];
+                for (int i = 0; i < lines; i++) {
+                    starts[i] = layout.getLineStart(i);
+                    ends[i] = layout.getLineEnd(i);
+                    tops[i] = layout.getLineTop(i);
+                    bottoms[i] = layout.getLineBottom(i);
+                }
+                return Paginator.slice(starts, ends, tops, bottoms, pageBudget,
+                        text.length());
             }
         }, new Bg.Done<List<int[]>>() {
             @Override
@@ -444,6 +579,7 @@ public class ArticleActivity extends Activity {
                     }
                 }
                 showPage(idx);
+                ensureArticleImages();
             }
         });
     }
@@ -500,6 +636,82 @@ public class ArticleActivity extends Activity {
         }
     }
 
+    // ---------------- inline body images ----------------
+
+    /** Width available to body text (the article view spans the full screen). */
+    private int textWidthPx() {
+        int w = bodyView.getWidth();
+        if (w <= 0) w = getResources().getDisplayMetrics().widthPixels;
+        return w - bodyView.getPaddingLeft() - bodyView.getPaddingRight();
+    }
+
+    private void toggleImages() {
+        boolean on = !Prefs.imagesEnabled(this);
+        Prefs.setImagesEnabled(this, on);
+        imgBtn.setText(on ? "图片：开" : "图片：关");
+        Toast.makeText(this, on ? "正文图片已开启" : "正文图片已关闭",
+                Toast.LENGTH_SHORT).show();
+        if (parts != null) {
+            int keep = (pages != null && !pages.isEmpty()) ? pages.get(pageIdx)[0] : 0;
+            float density = getResources().getDisplayMetrics().density;
+            doc = buildDoc(parts, Prefs.FONT_SIZES_SP[Prefs.fontLevel(this)], density);
+            paginate(keep);
+        }
+    }
+
+    /**
+     * Fetch bitmaps for the doc's inline image boxes (once per span). Box sizes
+     * are fixed at parse time, so a bitmap arriving only repaints — it can
+     * never shift the pagination.
+     */
+    private void ensureArticleImages() {
+        if (doc == null || !Prefs.imagesEnabled(this)) return;
+        BodyParser.BodyImageSpan[] spans = doc.getSpans(0, doc.length(),
+                BodyParser.BodyImageSpan.class);
+        if (spans == null || spans.length == 0) return;
+        final List<BodyParser.BodyImageSpan> todo =
+                new ArrayList<BodyParser.BodyImageSpan>();
+        for (BodyParser.BodyImageSpan s : spans) {
+            if (!s.requested && !s.hasBitmap()) {
+                s.requested = true;
+                todo.add(s);
+            }
+        }
+        if (todo.isEmpty()) return;
+        final SpannableStringBuilder builtFor = doc;
+        Bg.run(new Bg.Work<List<Object[]>>() {
+            @Override
+            public List<Object[]> run() {
+                List<Object[]> out = new ArrayList<Object[]>();
+                for (BodyParser.BodyImageSpan s : todo) {
+                    Bitmap bmp = Images.loadArticleImage(s.url, s.boxW);
+                    if (bmp != null) out.add(new Object[]{s, bmp});
+                }
+                return out;
+            }
+        }, new Bg.Done<List<Object[]>>() {
+            @Override
+            public void onDone(List<Object[]> result, Exception error) {
+                if (result == null || doc != builtFor) return;
+                boolean any = false;
+                for (Object[] pair : result) {
+                    ((BodyParser.BodyImageSpan) pair[0]).setBitmap((Bitmap) pair[1]);
+                    any = true;
+                }
+                if (any) bodyView.invalidate();
+            }
+        });
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // The same switch lives on the home screen; keep this label in sync.
+        if (imgBtn != null) {
+            imgBtn.setText(Prefs.imagesEnabled(this) ? "图片：开" : "图片：关");
+        }
+    }
+
     // ---------------- tap handling: spans first, paging second ----------------
 
     private void handleTap(float x, float y) {
@@ -519,7 +731,25 @@ public class ArticleActivity extends Activity {
                 return;
             }
             if (hit instanceof BodyParser.ImageSpan) {
-                if (Prefs.imagesEnabled(this)) {
+                BodyParser.BodyImageSpan box = findBodyImage((BodyParser.ImageSpan) hit);
+                if (box != null) {
+                    // Inline image box (images on): the box itself must not
+                    // swallow taps into a zoom — on an e-ink screen that was
+                    // a constant mis-tap. Only the badge drawn in the box's
+                    // top-right corner opens the viewer; a tap anywhere else
+                    // on the box pages like a tap on plain text.
+                    if (tapOnBadge(x, y, layout, box)) {
+                        Intent it = new Intent(this, ImageViewerActivity.class);
+                        it.putExtra(ImageViewerActivity.EXTRA_URL,
+                                ((BodyParser.ImageSpan) hit).url);
+                        startActivity(it);
+                    } else if (x < width / 2f) {
+                        prevPage();
+                    } else {
+                        nextPage();
+                    }
+                } else if (Prefs.imagesEnabled(this)) {
+                    // "[图片]" placeholder text (no inline box): old behavior.
                     Intent it = new Intent(this, ImageViewerActivity.class);
                     it.putExtra(ImageViewerActivity.EXTRA_URL, ((BodyParser.ImageSpan) hit).url);
                     startActivity(it);
@@ -532,6 +762,42 @@ public class ArticleActivity extends Activity {
         } else {
             nextPage();
         }
+    }
+
+    /** The inline image box sharing the tapped ImageSpan's range, if any. */
+    private BodyParser.BodyImageSpan findBodyImage(BodyParser.ImageSpan img) {
+        if (doc == null) return null;
+        int s = doc.getSpanStart(img);
+        int e = doc.getSpanEnd(img);
+        if (s < 0 || e <= s) return null;
+        BodyParser.BodyImageSpan[] arr = doc.getSpans(s, e, BodyParser.BodyImageSpan.class);
+        return (arr != null && arr.length > 0) ? arr[0] : null;
+    }
+
+    /**
+     * True when the tap lands on the zoom badge pinned to the image box's
+     * top-right corner. The box's rect is recovered from the current page
+     * layout: the image char sits alone on its line at the line's start, and
+     * the drawable fills the line exactly (see BodyImageSpan.getSize).
+     * The hit square (48dp) is a bit larger than the drawn badge (40dp).
+     */
+    private boolean tapOnBadge(float x, float y, Layout layout, BodyParser.BodyImageSpan box) {
+        if (doc == null || pages == null) return false;
+        int s = doc.getSpanStart(box);
+        if (s < 0) return false;
+        int local = s - pages.get(pageIdx)[0];
+        if (local < 0) return false;
+        int line = layout.getLineForOffset(local);
+        int boxLeft = bodyView.getTotalPaddingLeft() - bodyView.getScrollX()
+                + (int) layout.getPrimaryHorizontal(local);
+        int boxTop = bodyView.getTotalPaddingTop() - bodyView.getScrollY()
+                + layout.getLineTop(line);
+        int hit = (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP,
+                BodyParser.BADGE_HIT_DP, getResources().getDisplayMetrics());
+        int slack = hit / 6;
+        int right = boxLeft + box.boxW;
+        return x >= right - hit && x < right + slack
+                && y >= boxTop - slack && y < boxTop + hit;
     }
 
     private ClickableSpan findSpan(int off, Class<? extends ClickableSpan> type) {
@@ -570,6 +836,7 @@ public class ArticleActivity extends Activity {
                 it.putExtra("documentId", m.group(1));
                 it.putExtra("headline", "");
                 startActivity(it);
+                finish(); // replace, don't stack (same rule as related hops)
                 return;
             }
         }
@@ -652,18 +919,7 @@ public class ArticleActivity extends Activity {
                 meta = (TextView) row.findViewWithTag("m");
             }
             Models.Card c = related.get(position);
-            if (c.paid) {
-                SpannableStringBuilder sb = new SpannableStringBuilder();
-                sb.append(" 付费 ");
-                sb.setSpan(new BackgroundColorSpan(Color.BLACK), 0, sb.length(),
-                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                sb.setSpan(new ForegroundColorSpan(Color.WHITE), 0, sb.length(),
-                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                sb.append("  ").append(c.headline);
-                headline.setText(sb);
-            } else {
-                headline.setText(c.headline);
-            }
+            headline.setText(c.headline);
             StringBuilder mb = new StringBuilder();
             if (c.sectionName.length() > 0) mb.append(c.sectionName);
             String t = Ui.formatTime(c.pubTimeSec);
